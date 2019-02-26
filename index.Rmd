@@ -19,7 +19,7 @@ library(doParallel)
 data_src_url <- "https://d396qusza40orc.cloudfront.net/predmachlearn"
 train_filename <- "pml-training.csv"
 test_filename <- "pml-testing.csv"
-data_dir <- "./data"
+data_dir <- "."
 data_dir_files <- list.files(data_dir)
 
 if (!train_filename %in% data_dir_files | !test_filename %in% data_dir_files) {
@@ -31,11 +31,11 @@ if (!train_filename %in% data_dir_files | !test_filename %in% data_dir_files) {
 ```
 
 ```{r load data}
-df.train <- read.csv(paste("./data",train_filename, sep = "/"))
-df.test <- read.csv(paste("./data",test_filename, sep = "/"))
+df.train <- read.csv(paste(data_dir,train_filename, sep = "/"))
+df.test <- read.csv(paste(data_dir,test_filename, sep = "/"))
 ```
 
-```{r}
+```{r, echo=TRUE}
 dim(df.train)
 summary(df.train)
 ```
@@ -47,36 +47,43 @@ and several have `#DIV/0` errors as well.
 19216 is enough to make the column useless, so just get rid of 
 them.
 
-So far, I haven't seen 
-any columns with errors without the blanks, but some have blanks
-but no errors. The `new_window` variable has 19216 `no` values.
-Coincidence?
 
-```{r}
+```{r, eval=FALSE}
+# So far, I haven't seen 
+# any columns with errors without the blanks, but some have blanks
+# but no errors. The `new_window` variable has 19216 `no` values.
+# Coincidence?
 df.train %>% filter(new_window == "no") %>% summary()
+# Not a coincidence, but not actually helpful as far as I can tell.
 ```
 
-Not a coincidence, but not actually helpful as far as I can tell.
-
-```{r}
+What about variable classes?
+```{r, echo=TRUE}
 str(df.train)
 ```
 
 So everything with an error has become a factor variable, which
 complicates filtering them a bit. 
 
-```{r choose variables}
+We will remove every variable that has more than 2000 errors or
+missing values, knowing that most or all of these have over
+20000.
+
+Also drop a few columns that serve as de facto row identifiers
+and will mess with results.
+
+```{r choose variables, echo = TRUE}
 df.train <- df.train %>% 
     # 2000 chosen arbitrarily as ~10% of variables
     select_if(~sum(is.na(.)) < 2000 & sum(. == "") < 2000) %>%
     # Remove the variables that allow identifying rows
     select(-X, -contains("timestamp"), -new_window, -num_window)
 
-dim(df.train)
+# dim(df.train)
 ```
 
 # Explore
-```{r}
+```{r, eval=FALSE}
 # These are arbitrarily selected and it's a waste of time.
 qplot(classe, y = magnet_forearm_x, data = df.train)
 qplot(classe, y = accel_dumbbell_x, data = df.train)
@@ -105,14 +112,16 @@ Classe A seems to have some important outliers
 filter(df.train, gyros_dumbbell_x < -100)
 ```
 
-The first 2 points above are all from the same rep, which we
-should consider filtering out if things get weird.
+The first 2 points above are from the same row, which we
+can consider if things get weird but we'll leave for now.
 
 # Feature Reduction
 Running through some of the models the first time puts a strain
 on my computer, to the point that it doesn't always finish
 without running out of memory. Here are a couple of options to
 reduce.
+
+## findCorrelation
 
 `findCorrelation` returns a list of columns to remove to reduce
 correlation. A lower cutoff value will be more aggressive.
@@ -123,10 +132,12 @@ cor(select(df.train, -classe, -user_name)) %>%
     findCorrelation(cutoff=cutoff, names=T)
 ```
 
+## varImp by Tree model
+
 Strictly speaking model building comes later, but use a tree
 model for variable importance.
 
-```{r}
+```{r, echo = TRUE}
 set.seed(1984)
 tree <- train(classe ~ ., data = df.train, method = "rpart")
 imp <- varImp(tree)$importance 
@@ -136,17 +147,18 @@ imp <- imp %>%
     arrange(-Overall)
 
 feature.cols <- imp$var
+feature.cols
 ```
 
-```{r setup parallel}
-cluster <- makeCluster(detectCores() - 1)
-```
+There is some correlation between the methods. We will use the 
+model-based version since I expect it to be better at identfying
+complex relationships than the correlation model.
 
 # Models
-```{r models, cache=TRUE}
+```{r models, cache=TRUE, include=FALSE, echo=TRUE}
+# Go get out for coffee or something, this will take a while.
 control <- trainControl(method="cv", 
-                        number=10, 
-                        allowParallel = TRUE)
+                        number=10)
 
 df.train.filtered <- select(df.train, feature.cols, classe)
 tree <- train(x = select(df.train.filtered, -classe), 
@@ -156,29 +168,37 @@ lda <- train(x = select(df.train.filtered, -classe),
               y = df.train.filtered$classe,
               method = "lda", trControl = control)
 
-registerDoParallel(cluster)
 rf <- train(x = select(df.train.filtered, -classe), 
               y = df.train.filtered$classe,
               method = "rf", trControl = control)
 gbm <- train(x = select(df.train.filtered, -classe), 
               y = df.train.filtered$classe,
               method = "gbm", trControl = control)
-
-stopCluster(cluster)
-registerDoSEQ()
 ```
 
+Now we can compare these methods by confusion matrices.
 
-
+### Decision Tree
 ```{r}
 confusionMatrix.train(tree)
+```
+
+### Random Forest
+```{r}
 confusionMatrix.train(rf)
+```
+
+### Gradient Boosting Machine (boosted tree)
+```{r}
 confusionMatrix.train(gbm)
+```
+
+### Linear Discriminant Analysis
+```{r}
 confusionMatrix.train(lda)
 ```
 
-
-Random forest is the clear best bet. Can we improve it?
+Random forest is the clear best bet, but can we improve it?
 
 ```{r}
 plot(rf)
@@ -203,7 +223,7 @@ So 2 is the best of our tried `mtry` values (2, 8, 14), and
 there is maybe a trend of improvement as they decrease. We will
 test 1 and a few in the high end range between 2 and 8.
  
-```{r, cache=TRUE}
+```{r, cache=TRUE, echo=TRUE}
 grid <- expand.grid(mtry = c(1, 2, 4, 6))
 
 rf2 <- train(x = select(df.train.filtered, -classe),
@@ -219,11 +239,13 @@ rf2
 ```
 
 So our preferred `mtry` value is 4, which gives an accuracy of 
-99.19%. Let's hope that is good enough for the quiz.
+99.19% and an out of sample error rate of
+`r rf2$finalModel$err.rate[500, 'OOB']`.
+Let's hope that is good enough for the quiz.
 
-```{r}
-test.predictions = data_frame(values = predict.train(rf2, df.test))
-test.predictions
+```{r, echo=TRUE}
+test.predictions = data_frame(PredictedValue = predict.train(rf2, df.test))
+test.predictions %>% knitr::kable()
 ```
 
 It is!
