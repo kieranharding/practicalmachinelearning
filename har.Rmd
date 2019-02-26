@@ -1,0 +1,230 @@
+---
+title: "Human Activity Recognition"
+author: "Kieran Harding"
+date: "09/02/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(parallel)
+library(doParallel)
+```
+
+# Prepare Data
+```{r get data}
+data_src_url <- "https://d396qusza40orc.cloudfront.net/predmachlearn"
+train_filename <- "pml-training.csv"
+test_filename <- "pml-testing.csv"
+data_dir <- "./data"
+data_dir_files <- list.files(data_dir)
+
+if (!train_filename %in% data_dir_files | !test_filename %in% data_dir_files) {
+    download.file(paste(data_src_url, train_filename, 
+                        sep = "/", dest = "data_dir"))
+    download.file(paste(data_src_url, test_filename, 
+                        sep = "/", dest = "data_dir"))
+}
+```
+
+```{r load data}
+df.train <- read.csv(paste("./data",train_filename, sep = "/"))
+df.test <- read.csv(paste("./data",test_filename, sep = "/"))
+```
+
+```{r}
+dim(df.train)
+summary(df.train)
+```
+
+19622 rows, but plenty of columns don't populate them very well.
+There seems to be a pattern of columns missing 19216 items, 
+and several have `#DIV/0` errors as well. 
+
+19216 is enough to make the column useless, so just get rid of 
+them.
+
+So far, I haven't seen 
+any columns with errors without the blanks, but some have blanks
+but no errors. The `new_window` variable has 19216 `no` values.
+Coincidence?
+
+```{r}
+df.train %>% filter(new_window == "no") %>% summary()
+```
+
+Not a coincidence, but not actually helpful as far as I can tell.
+
+```{r}
+str(df.train)
+```
+
+So everything with an error has become a factor variable, which
+complicates filtering them a bit. 
+
+```{r choose variables}
+df.train <- df.train %>% 
+    # 2000 chosen arbitrarily as ~10% of variables
+    select_if(~sum(is.na(.)) < 2000 & sum(. == "") < 2000) %>%
+    # Remove the variables that allow identifying rows
+    select(-X, -contains("timestamp"), -new_window, -num_window)
+
+dim(df.train)
+```
+
+# Explore
+```{r}
+# These are arbitrarily selected and it's a waste of time.
+qplot(classe, y = magnet_forearm_x, data = df.train)
+qplot(classe, y = accel_dumbbell_x, data = df.train)
+```
+
+```{r}
+df.train %>% 
+    select(-user_name) %>%
+    gather(key = key, value = value, -classe) %>%
+    ggplot(aes(classe, value)) + geom_boxplot() +
+    facet_wrap(~ key, scales = "free_y")
+
+```
+
+I thought that I would find this useless, but it turns out there
+may be some value here.
+
+Classe A seems to have some important outliers
+ - There's a low one in `gyros_dumbbell_x` and a high one in each
+ of `gyros_dumbbell_y` and `gyros_dumbbell_z`
+ - The same pattern shows up in `gyros_forearm...`
+ - There's a less extreme low outlier in `magnet_dumbbell_y`
+ 
+ 
+```{r}
+filter(df.train, gyros_dumbbell_x < -100)
+```
+
+The first 2 points above are all from the same rep, which we
+should consider filtering out if things get weird.
+
+# Feature Reduction
+Running through some of the models the first time puts a strain
+on my computer, to the point that it doesn't always finish
+without running out of memory. Here are a couple of options to
+reduce.
+
+`findCorrelation` returns a list of columns to remove to reduce
+correlation. A lower cutoff value will be more aggressive.
+
+```{r}
+cutoff <- 0.75
+cor(select(df.train, -classe, -user_name)) %>%
+    findCorrelation(cutoff=cutoff, names=T)
+```
+
+Strictly speaking model building comes later, but use a tree
+model for variable importance.
+
+```{r}
+set.seed(1984)
+tree <- train(classe ~ ., data = df.train, method = "rpart")
+imp <- varImp(tree)$importance 
+imp$var <- row.names(imp) 
+imp <- imp %>% 
+    filter(Overall > 0) %>%
+    arrange(-Overall)
+
+feature.cols <- imp$var
+```
+
+```{r setup parallel}
+cluster <- makeCluster(detectCores() - 1)
+```
+
+# Models
+```{r models, cache=TRUE}
+control <- trainControl(method="cv", 
+                        number=10, 
+                        allowParallel = TRUE)
+
+df.train.filtered <- select(df.train, feature.cols, classe)
+tree <- train(x = select(df.train.filtered, -classe), 
+              y = df.train.filtered$classe,
+              method = "rpart", trControl = control)
+lda <- train(x = select(df.train.filtered, -classe), 
+              y = df.train.filtered$classe,
+              method = "lda", trControl = control)
+
+registerDoParallel(cluster)
+rf <- train(x = select(df.train.filtered, -classe), 
+              y = df.train.filtered$classe,
+              method = "rf", trControl = control)
+gbm <- train(x = select(df.train.filtered, -classe), 
+              y = df.train.filtered$classe,
+              method = "gbm", trControl = control)
+
+stopCluster(cluster)
+registerDoSEQ()
+```
+
+
+
+```{r}
+confusionMatrix.train(tree)
+confusionMatrix.train(rf)
+confusionMatrix.train(gbm)
+confusionMatrix.train(lda)
+```
+
+
+Random forest is the clear best bet. Can we improve it?
+
+```{r}
+plot(rf)
+```
+
+```{r}
+rf.err <- as_tibble(rf$finalModel$err.rate) %>%
+    mutate(ntree = 1:500)
+
+g <- ggplot(rf.err, aes(x = ntree, y = OOB))
+g <- g + geom_point()
+g <- g + theme_bw()
+g
+```
+
+The out-of-bag error seems to be mostly stabilized around 100
+trees, but does still continue. We can do our grid search with
+100 trees  to get it done in a decent amount of time, then our
+final model will use more.
+
+So 2 is the best of our tried `mtry` values (2, 8, 14), and 
+there is maybe a trend of improvement as they decrease. We will
+test 1 and a few in the high end range between 2 and 8.
+ 
+```{r, cache=TRUE}
+grid <- expand.grid(mtry = c(1, 2, 4, 6))
+
+rf2 <- train(x = select(df.train.filtered, -classe),
+             y = df.train.filtered$classe,
+             method = "rf", trControl = control, 
+             tuneGrid = grid)
+
+```
+
+```{r}
+plot(rf2)
+rf2
+```
+
+So our preferred `mtry` value is 4, which gives an accuracy of 
+99.19%. Let's hope that is good enough for the quiz.
+
+```{r}
+test.predictions = data_frame(values = predict.train(rf2, df.test))
+test.predictions
+```
+
+It is!
+
