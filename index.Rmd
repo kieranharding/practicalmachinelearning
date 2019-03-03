@@ -1,8 +1,9 @@
 ---
 title: "Human Activity Recognition"
 author: "Kieran Harding"
-date: "09/02/2019"
-output: html_document
+date: "03/03/2019"
+output: 
+    html_document
 ---
 
 ```{r setup, include=FALSE}
@@ -10,11 +11,25 @@ knitr::opts_chunk$set(echo = FALSE)
 library(tidyverse)
 library(caret)
 library(randomForest)
-library(parallel)
-library(doParallel)
 ```
 
-# Prepare Data
+# Summary
+
+The Weight Lifting Exercises dataset (WLE) was prepared to test recognition
+of how well a given exercise (Unilateral Dumbbell Biceps Curl) using data
+from sensors on the subject's body. This report attempts to use the sensor
+data to identify which classe each repetition falls under (correctly 
+performed, or one of 4 common mistakes).
+
+Of the methods tested, Random Forests was found to perform the best, though
+boosted trees follows closely. By adjusting the Random Forest parameter to
+use 4 random variables per tree, we were able to correctly predict all 20 of
+the test cases.
+
+Further improvement may be possible by increasing the tree count and by 
+investigating (and eliminating, if warranted) some outlier values in the
+training dataset that could represent errors in data collection.
+
 ```{r get data}
 data_src_url <- "https://d396qusza40orc.cloudfront.net/predmachlearn"
 train_filename <- "pml-training.csv"
@@ -35,18 +50,22 @@ df.train <- read.csv(paste(data_dir,train_filename, sep = "/"))
 df.test <- read.csv(paste(data_dir,test_filename, sep = "/"))
 ```
 
+# Explore the data
 ```{r, echo=TRUE}
 dim(df.train)
+```
+```{r summary.all, eval=FALSE, echo=TRUE}
 summary(df.train)
 ```
 
-19622 rows, but plenty of columns don't populate them very well.
+See the appendix for the output of the summary call, but
+it has 19622 rows, with plenty of columns not populating
+them very well.
 There seems to be a pattern of columns missing 19216 items, 
 and several have `#DIV/0` errors as well. 
 
-19216 is enough to make the column useless, so just get rid of 
-them.
-
+This is enough to make the column useless, so we will
+just get rid of them.
 
 ```{r, eval=FALSE}
 # So far, I haven't seen 
@@ -58,12 +77,16 @@ df.train %>% filter(new_window == "no") %>% summary()
 ```
 
 What about variable classes?
-```{r, echo=TRUE}
+```{r classes.all, echo=TRUE, eval=FALSE}
 str(df.train)
 ```
 
-So everything with an error has become a factor variable, which
-complicates filtering them a bit. 
+Again, output is in the appendix.
+What we learn is that everything with an error has become 
+a factor variable, which may complicate filtering them a bit.
+Luckily, it looks like every
+column with errors also has the 19216 blank values so they will
+get filtered that way.
 
 We will remove every variable that has more than 2000 errors or
 missing values, knowing that most or all of these have over
@@ -82,38 +105,37 @@ df.train <- df.train %>%
 # dim(df.train)
 ```
 
-# Explore
 ```{r, eval=FALSE}
 # These are arbitrarily selected and it's a waste of time.
 qplot(classe, y = magnet_forearm_x, data = df.train)
 qplot(classe, y = accel_dumbbell_x, data = df.train)
 ```
 
-```{r}
+
+```{r boxplots.all, eval=FALSE, echo=FALSE}
 df.train %>% 
     select(-user_name) %>%
     gather(key = key, value = value, -classe) %>%
     ggplot(aes(classe, value)) + geom_boxplot() +
-    facet_wrap(~ key, scales = "free_y")
+    facet_wrap(~ key, scales = "free_y", ncol=5)
 
 ```
 
-I thought that I would find this useless, but it turns out there
-may be some value here.
+A pairplot to look for relationships (in the Appendix) shows that 
+Classe A seems to have some important outliers:
 
-Classe A seems to have some important outliers
- - There's a low one in `gyros_dumbbell_x` and a high one in each
+ * There's a low one in `gyros_dumbbell_x` and a high one in each
  of `gyros_dumbbell_y` and `gyros_dumbbell_z`
- - The same pattern shows up in `gyros_forearm...`
- - There's a less extreme low outlier in `magnet_dumbbell_y`
+ * The same pattern shows up in `gyros_forearm...`
+ * There's a less extreme low outlier in `magnet_dumbbell_y`
  
  
-```{r}
+```{r, eval=FALSE}
 filter(df.train, gyros_dumbbell_x < -100)
 ```
 
-The first 2 points above are from the same row, which we
-can consider if things get weird but we'll leave for now.
+This isn't a dealbreaker right now, but it's worth remembering
+in case later results are strange.
 
 # Feature Reduction
 Running through some of the models the first time puts a strain
@@ -126,7 +148,7 @@ reduce.
 `findCorrelation` returns a list of columns to remove to reduce
 correlation. A lower cutoff value will be more aggressive.
 
-```{r}
+```{r, echo=TRUE}
 cutoff <- 0.75
 cor(select(df.train, -classe, -user_name)) %>%
     findCorrelation(cutoff=cutoff, names=T)
@@ -150,11 +172,16 @@ feature.cols <- imp$var
 feature.cols
 ```
 
-There is some correlation between the methods. We will use the 
+There is some overlap between the methods. We will use the 
 model-based version since I expect it to be better at identfying
 complex relationships than the correlation model.
 
 # Models
+
+We will used cross-validation to compare the models. 10 folds
+should be good to strike a balance between bias reduction and
+not straining my computer (or patience).
+
 ```{r models, cache=TRUE, include=FALSE, echo=TRUE}
 # Go get out for coffee or something, this will take a while.
 control <- trainControl(method="cv", 
@@ -215,15 +242,15 @@ g
 ```
 
 The out-of-bag error seems to be mostly stabilized around 100
-trees, but does still continue. We can do our grid search with
-100 trees  to get it done in a decent amount of time, then our
-final model will use more.
+trees, but does still continue to improve slightly. 
+We will leave it as-is, and increase later if we need it.
 
 So 2 is the best of our tried `mtry` values (2, 8, 14), and 
 there is maybe a trend of improvement as they decrease. We will
 test 1 and a few in the high end range between 2 and 8.
  
-```{r, cache=TRUE, echo=TRUE}
+# Final Model
+```{r second rf, cache=TRUE, echo=TRUE}
 grid <- expand.grid(mtry = c(1, 2, 4, 6))
 
 rf2 <- train(x = select(df.train.filtered, -classe),
@@ -240,13 +267,17 @@ rf2
 
 So our preferred `mtry` value is 4, which gives an accuracy of 
 99.19% and an out of sample error rate of
-`r rf2$finalModel$err.rate[500, 'OOB']`.
-Let's hope that is good enough for the quiz.
+`r rf2$finalModel$err.rate[500, 'OOB']`, which turns out to be
+good enough for the quiz.
 
-```{r, echo=TRUE}
-test.predictions = data_frame(PredictedValue = predict.train(rf2, df.test))
-test.predictions %>% knitr::kable()
+# Appendix
+### Long outputs
+
+```{r summary.all, echo=TRUE, eval=TRUE}
+```
+```{r classes.all, echo=TRUE, eval=TRUE}
+```
+```{r boxplots.all, echo=TRUE, eval=TRUE,fig.dim = c(9,15)}
 ```
 
-It is!
 
